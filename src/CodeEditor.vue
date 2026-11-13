@@ -6,8 +6,6 @@ import {
   lineNumbers,
   highlightActiveLine,
   highlightActiveLineGutter,
-  drawSelection,
-  dropCursor,
 } from '@codemirror/view';
 import { EditorState, Compartment } from '@codemirror/state';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
@@ -41,11 +39,10 @@ function buildState(doc: string, format: string) {
       highlightActiveLineGutter(),
       highlightActiveLine(),
       history(),
-      drawSelection(),
-      dropCursor(),
+      // 不用 drawSelection：其 z-index:-1 选中层会被 activeLine 等背景盖住，
+      // 首行/尾行高亮经常缺失。改用浏览器原生选中（::selection 上色），全行可靠。
       indentOnInput(),
       bracketMatching(),
-      EditorState.allowMultipleSelections.of(true),
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
       keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
       EditorView.lineWrapping,
@@ -62,7 +59,8 @@ function buildState(doc: string, format: string) {
           borderRight: '1px solid #e2e8f0',
         },
         '.cm-activeLineGutter': { backgroundColor: '#eef2f7' },
-        '.cm-activeLine': { backgroundColor: '#f8fafc' },
+        // 半透明，避免盖住选中高亮
+        '.cm-activeLine': { backgroundColor: 'rgba(248, 250, 252, 0.55)' },
         '.cm-content': { caretColor: '#0f172a' },
       }),
     ],
@@ -107,7 +105,19 @@ onBeforeUnmount(() => view?.destroy());
   border-radius: 8px;
   overflow: hidden;
   background: #fff;
+  /* drawSelection 的选中层是 z-index:-1 的图层，外层需形成层叠上下文，
+     否则会被这里的白色背景遮住（选中了但看不到高亮） */
+  position: relative;
+  isolation: isolate;
   transition: border-color 0.15s, box-shadow 0.15s;
+}
+/* 原生选中高亮（青色），覆盖所有选中行 */
+.code-editor .cm-content ::selection,
+.code-editor .cm-content::selection {
+  background: rgba(13, 148, 136, 0.3);
+}
+.code-editor .cm-editor.cm-focused .cm-selectionLayer .cm-selectionBackground {
+  background: rgba(13, 148, 136, 0.28) !important;
 }
 .code-editor:focus-within {
   border-color: #0d9488;

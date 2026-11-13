@@ -24,6 +24,7 @@ interface PublishConfig {
   intervalMs: number;
   durationSec: number;
   durationUnit: 'sec' | 'hour';
+  autoSeq: boolean;
 }
 interface Profile {
   id: string;
@@ -49,12 +50,12 @@ interface Message {
 const FORMAT_TEMPLATES: Record<Format, string> = {
   json: '{\n  "seq": {{seq}},\n  "cmd": "down",\n  "ts": {{timestamp}}\n}',
   protobuf: '0a0548656c6c6f',
-  plaintext: 'down-{{seq}}',
+  plaintext: 'hello {{seq}}',
 };
 const FORMAT_HINTS: Record<Format, string> = {
-  json: '支持变量 {{seq}} {{timestamp}} {{datetime}} {{clientId}}',
+  json: '支持变量 {{seq}} {{timestamp}} {{datetime}} {{clientId}}；新一批从 1 递增，暂停续发接着计数',
   protobuf: 'protobuf 二进制 hex 编码（如 0a0548656c6c6f），不支持变量替换',
-  plaintext: '支持变量 {{seq}} {{timestamp}} {{datetime}} {{clientId}}',
+  plaintext: '支持变量 {{seq}} {{timestamp}} {{datetime}} {{clientId}}；新一批从 1 递增，暂停续发接着计数',
 };
 // 记住各格式各自的内容，切换时不丢失
 const savedPayloads: Record<Format, string> = { ...FORMAT_TEMPLATES };
@@ -74,6 +75,7 @@ function defaultPublish(): PublishConfig {
     intervalMs: 1000,
     durationSec: 60,
     durationUnit: 'sec',
+    autoSeq: false,
   };
 }
 function newId() {
@@ -89,6 +91,13 @@ const timeoutMs = ref(10000);
 const connected = ref(false);
 const connecting = ref(false);
 const statusText = ref('未连接');
+const errorMsg = ref('');
+function showError(msg: string) {
+  errorMsg.value = msg;
+}
+function closeError() {
+  errorMsg.value = '';
+}
 
 const subInput = ref('');
 const subQos = ref(0);
@@ -98,6 +107,11 @@ const filter = ref<'all' | 'send' | 'recv'>('all');
 let seq = 1;
 let timer: number | null = null;
 let stopping = false;
+// 发送任务状态：idle 空闲 / running 发送中 / paused 已暂停（断点保留，可续发）
+type SendState = 'idle' | 'running' | 'paused';
+const sendState = ref<SendState>('idle');
+const pausedLeft = ref(0); // 按数量：剩余包数
+const pausedLeftMs = ref(0); // 按时长：剩余毫秒
 let msgId = 0;
 let unlistenMsg: UnlistenFn | null = null;
 let unlistenStatus: UnlistenFn | null = null;
@@ -210,6 +224,7 @@ function switchProfile(id: string) {
   if (p) applyProfile(p);
   messages.value = [];
   seq = 1;
+  resetSendState();
   persistProfiles();
 }
 function onProfileSelectChange(e: Event) {
@@ -237,6 +252,7 @@ function confirmProfileModal() {
     applyProfile(p);
     messages.value = [];
     seq = 1;
+    resetSendState();
   } else {
     const p = profiles.value.find((x) => x.id === activeProfileId.value);
     if (p) p.name = name;
@@ -254,6 +270,7 @@ function confirmDelete() {
   applyProfile(profiles.value[0]);
   messages.value = [];
   seq = 1;
+  resetSendState();
   persistProfiles();
   showDeleteModal.value = false;
 }
@@ -289,6 +306,15 @@ function switchFormat(f: Format) {
   saveConfig();
 }
 const formatHint = computed(() => FORMAT_HINTS[publish.format]);
+
+// 暂停态提示（显示剩余量，说明续发不会重置序号）
+const pausedTip = computed(() => {
+  if (sendState.value !== 'paused') return '';
+  if (publish.mode === 'count') {
+    return `已暂停：剩余 ${pausedLeft.value} 包未发送，点「继续发送」接着发（序号不重置）`;
+  }
+  return `已暂停：剩余 ${Math.max(1, Math.ceil(pausedLeftMs.value / 1000))} 秒，点「继续发送」接着发（序号不重置）`;
+});
 
 // ---------- 统计 ----------
 const stats = computed(() => {
@@ -332,6 +358,24 @@ function resolveVariables(template: string, s: number) {
     .replace(/\{\{\s*clientId\s*\}\}/g, conn.clientId);
 }
 
+// 勾选「自动填充序号」时，把 {{seq}} 变量一次性填入消息内容（取消勾选不回退已有内容）
+function toggleAutoSeq() {
+  if (!publish.autoSeq || publish.format === 'protobuf') return;
+  if (publish.payload.includes('{{seq}}')) return;
+  if (publish.format === 'json') {
+    // JSON 已有 seq 字段则不重复插入
+    if (/["']seq["']\s*:/.test(publish.payload)) return;
+    publish.payload = publish.payload.replace(/\{/, '{\n  "seq": {{seq}},');
+    return;
+  }
+  // 明文：结尾是数字则替换为变量（hello 1 → hello {{seq}}），否则在末尾追加
+  if (/\d+\s*$/.test(publish.payload)) {
+    publish.payload = publish.payload.replace(/\d+\s*$/, '{{seq}}');
+  } else {
+    publish.payload = publish.payload.trimEnd() + ' {{seq}}';
+  }
+}
+
 // 从回执 payload 中提取 seq（仅从 JSON 字段或明确的 seq= 字样提取，避免误判字面量数字）
 function extractSeq(payload: string): number | null {
   try {
@@ -356,7 +400,8 @@ async function doConnect() {
     await invoke('connect', { config: { ...conn } });
   } catch (e) {
     connecting.value = false;
-    statusText.value = '连接失败: ' + e;
+    statusText.value = '连接失败';
+    showError('连接失败: ' + e);
   }
 }
 async function doDisconnect() {
@@ -380,7 +425,7 @@ async function addSub() {
     try {
       await invoke('subscribe', { topic, qos: subQos.value });
     } catch (e) {
-      statusText.value = '订阅失败: ' + e;
+      showError('订阅失败: ' + e);
     }
   }
 }
@@ -434,53 +479,109 @@ function sendOne() {
     },
   }).catch((e) => {
     rec.status = 'timeout';
-    statusText.value = '发送失败: ' + e;
+    showError('发送失败: ' + e);
   });
   seq++;
 }
 
-function startSend() {
-  stopping = false;
-  if (publish.mode === 'manual') {
-    sendOne();
-    return;
-  }
-  if (publish.mode === 'count') {
-    let remaining = publish.count;
-    const tick = () => {
-      if (stopping || remaining <= 0) {
-        stopSend();
-        return;
-      }
-      sendOne();
-      remaining--;
-    };
-    tick();
-    if (remaining > 0) timer = window.setInterval(tick, publish.intervalMs);
-  } else {
-    const start = Date.now();
-    const unitMs = publish.durationUnit === 'hour' ? 3600_000 : 1000;
-    const duration = publish.durationSec * unitMs;
-    const tick = () => {
-      if (stopping || Date.now() - start >= duration) {
-        stopSend();
-        return;
-      }
-      sendOne();
-    };
-    tick();
-    timer = window.setInterval(tick, publish.intervalMs);
-  }
-}
-function stopSend() {
-  stopping = true;
+// 清理定时器
+function clearTimer() {
   if (timer != null) {
     clearInterval(timer);
     timer = null;
   }
 }
+// 丢弃断点（切方案/切发送方式/自然结束后调用）
+function resetSendState() {
+  stopping = true;
+  clearTimer();
+  sendState.value = 'idle';
+  pausedLeft.value = 0;
+  pausedLeftMs.value = 0;
+}
+
+function startSend() {
+  if (publish.mode === 'manual') {
+    sendOne();
+    return;
+  }
+  if (sendState.value === 'running') return;
+  stopping = false;
+
+  if (publish.mode === 'count') {
+    // 有断点则续发（seq 不重置）；否则是新任务，seq 从 1 开始（方案 A）
+    const resuming = sendState.value === 'paused' && pausedLeft.value > 0;
+    if (!resuming) {
+      seq = 1;
+      pausedLeft.value = Math.max(1, publish.count);
+    }
+    sendState.value = 'running';
+    const tick = () => {
+      if (stopping || pausedLeft.value <= 0) {
+        finishRun();
+        return;
+      }
+      sendOne();
+      pausedLeft.value--;
+      // 最后一包发完立即收尾，避免按钮多亮一个间隔
+      if (pausedLeft.value <= 0) finishRun();
+    };
+    tick();
+    if (!stopping && sendState.value === 'running') {
+      timer = window.setInterval(tick, publish.intervalMs);
+    }
+  } else {
+    const unitMs = publish.durationUnit === 'hour' ? 3600_000 : 1000;
+    // 有断点则只跑剩余时长且 seq 不重置；否则是新任务，seq 从 1 开始
+    const resuming = sendState.value === 'paused' && pausedLeftMs.value > 0;
+    let totalMs: number;
+    if (resuming) {
+      totalMs = pausedLeftMs.value;
+    } else {
+      seq = 1;
+      totalMs = Math.max(1, publish.durationSec * unitMs);
+    }
+    sendState.value = 'running';
+    const start = Date.now();
+    const tick = () => {
+      const left = totalMs - (Date.now() - start);
+      if (stopping || left <= 0) {
+        finishRun();
+        return;
+      }
+      sendOne();
+      pausedLeftMs.value = left;
+    };
+    tick();
+    if (!stopping && sendState.value === 'running') {
+      timer = window.setInterval(tick, publish.intervalMs);
+    }
+  }
+}
+// 任务自然结束：清空断点，下次开始 = 新任务
+function finishRun() {
+  resetSendState();
+}
+// 用户点停止 = 暂停，保留断点（下次点「继续发送」接着发，seq 不重置）
+function stopSend() {
+  stopping = true;
+  clearTimer();
+  if (sendState.value === 'running') {
+    sendState.value = pausedLeft.value > 0 || pausedLeftMs.value > 0 ? 'paused' : 'idle';
+  }
+}
+// 放弃断点，重新从 1 开始发一批
+function restartSend() {
+  resetSendState();
+  startSend();
+}
 
 // ---------- 回执配对 + 超时 ----------
+// 严格序号核对：回执必须能对上号才算成功，否则该包保持 waiting 等超时标红。
+// 1. 回执带显式 seq（JSON 字段 / seq=、sn= 等）→ 按序号精确匹配；
+// 2. 回执无 seq → 按内容精确匹配（回执内容与发送内容一致才算成功）；
+// 3. 内容不完全一致时，回执结尾数字须与某条待回执包的序号相同（如 "ack hello 2" 可配 hello 2）；
+// 4. 都对不上则不配对（不做 FIFO 顺序兜底，避免序号错配的回执也算成功）。
 function onIncoming(msg: { topic: string; payload: string; qos: number; timestamp: number }) {
   const matched = extractSeq(msg.payload);
   let rec: Message | undefined;
@@ -489,9 +590,23 @@ function onIncoming(msg: { topic: string; payload: string; qos: number; timestam
       (m) => m.direction === 'send' && m.status === 'waiting' && m.seq === matched,
     );
   }
-  // 回执里没有 seq 时，按 FIFO 顺序配对最早的未回执包（兜底，避免误判超时）
   if (!rec) {
-    rec = messages.value.find((m) => m.direction === 'send' && m.status === 'waiting');
+    rec = messages.value.find(
+      (m) => m.direction === 'send' && m.status === 'waiting' && m.content === msg.payload,
+    );
+  }
+  if (!rec) {
+    const tail = msg.payload.match(/(\d+)\s*$/);
+    if (tail) {
+      const n = Number(tail[1]);
+      rec = messages.value.find(
+        (m) =>
+          m.direction === 'send' &&
+          m.status === 'waiting' &&
+          m.seq === n &&
+          m.content.trimEnd().endsWith(String(n)),
+      );
+    }
   }
   if (rec) rec.status = 'success';
   messages.value.push({
@@ -516,8 +631,14 @@ function checkTimeout() {
   }
 }
 
-// 消息内容变化时自动保存配置
-watch(() => publish.payload, () => saveConfig());
+// 消息内容变化时同步到格式缓存并自动保存配置
+watch(() => publish.payload, () => {
+  savedPayloads[publish.format] = publish.payload;
+  saveConfig();
+});
+
+// 切换发送方式会作废断点（按数量/按时长的续发语义不同，避免序号与剩余量错配）
+watch(() => publish.mode, () => resetSendState());
 
 // ---------- 生命周期 ----------
 onMounted(async () => {
@@ -538,8 +659,16 @@ onMounted(async () => {
     const s = e.payload as { connected: boolean; message: string };
     connected.value = s.connected;
     connecting.value = false;
-    statusText.value = s.message;
-    if (s.connected) resubscribeAll();
+    if (s.connected) {
+      statusText.value = s.message;
+      resubscribeAll();
+    } else if (s.message.startsWith('连接错误')) {
+      // 错误详情弹窗展示，角标只显示短语，避免长文本撑乱布局
+      statusText.value = '连接错误';
+      showError(s.message);
+    } else {
+      statusText.value = s.message;
+    }
   });
   window.setInterval(checkTimeout, 500);
 });
@@ -651,7 +780,21 @@ onUnmounted(() => {
               </div>
             </div>
             <CodeEditor v-model="publish.payload" :format="publish.format" />
-            <div class="fmt-hint">{{ formatHint }}</div>
+            <div class="fmt-hint">
+              <span>{{ formatHint }}</span>
+              <label
+                v-if="publish.format !== 'protobuf'"
+                class="auto-seq"
+                title="勾选时自动把序号变量填入消息内容"
+              >
+                <input
+                  v-model="publish.autoSeq"
+                  type="checkbox"
+                  @change="toggleAutoSeq(); saveConfig()"
+                />
+                自动填充序号递增
+              </label>
+            </div>
           </div>
 
           <div class="field inline-fields">
@@ -713,9 +856,26 @@ onUnmounted(() => {
             <input v-model.number="timeoutMs" type="number" min="100" class="num" @change="saveConfig" />
           </div>
 
+          <div v-if="pausedTip" class="paused-tip">{{ pausedTip }}</div>
+
           <div class="actions">
-            <button class="btn primary big" :disabled="!connected" @click="startSend">开始发送</button>
-            <button class="btn warn big" @click="stopSend">停止发送</button>
+            <button
+              class="btn primary big"
+              :disabled="!connected || sendState === 'running'"
+              @click="startSend"
+            >
+              {{ sendState === 'paused' && publish.mode !== 'manual' ? '继续发送' : '开始发送' }}
+            </button>
+            <button
+              class="btn warn big"
+              :disabled="sendState !== 'running'"
+              @click="stopSend"
+            >
+              停止发送
+            </button>
+            <button v-if="sendState === 'paused'" class="btn ghost big" @click="restartSend">
+              重新开始
+            </button>
           </div>
         </div>
       </section>
@@ -869,6 +1029,20 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
+
+    <!-- 错误提示弹窗 -->
+    <div v-if="errorMsg" class="modal-mask" @click.self="closeError">
+      <div class="modal err-modal">
+        <div class="modal-head">
+          <h3>错误提示</h3>
+          <button class="modal-x" @click="closeError">×</button>
+        </div>
+        <div class="modal-body err-body">{{ errorMsg }}</div>
+        <div class="modal-foot">
+          <button class="btn primary" @click="closeError">我知道了</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -911,7 +1085,16 @@ body { margin: 0; }
 }
 .profile-select:focus { outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(13,148,136,.12); }
 .top-right { display: flex; align-items: center; gap: 12px; flex: none; }
-.status-pill { padding: 4px 14px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.status-pill {
+  padding: 4px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .status-pill.ok { background: #dcfce7; color: var(--green); }
 .status-pill.off { background: #fee2e2; color: var(--red); }
 .status-pill.ing { background: #fef3c7; color: var(--amber); }
@@ -940,7 +1123,18 @@ body { margin: 0; }
 .ov-title { flex: 1; min-width: 0; }
 .ov-name { font-size: 14px; font-weight: 700; }
 .ov-sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
-.ov-status { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.ov-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: none;
+}
 .ov-status .dot { width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1; flex: none; }
 .ov-status.ok { color: var(--green); }
 .ov-status.ok .dot { background: var(--green); }
@@ -967,7 +1161,27 @@ body { margin: 0; }
 
 .label-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .label-row label { color: var(--muted); font-size: 12px; }
-.fmt-hint { margin-top: 7px; color: var(--muted); font-size: 11px; }
+.fmt-hint {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.auto-seq {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+.auto-seq input {
+  accent-color: var(--primary, #14b8a6);
+  cursor: pointer;
+}
 
 /* ---------- 内嵌标签输入组 ---------- */
 .igroup {
@@ -1010,7 +1224,7 @@ body { margin: 0; }
 /* ---------- 按钮 ---------- */
 .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: #fff; cursor: pointer; font-size: 12px; color: var(--text); white-space: nowrap; }
 .btn:hover { background: #f1f5f9; }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
 .btn.primary { background: var(--teal); color: #fff; border-color: var(--teal); }
 .btn.primary:hover { background: var(--teal-dark); }
 .btn.danger { background: var(--red); color: #fff; border-color: var(--red); }
@@ -1042,6 +1256,16 @@ body { margin: 0; }
 .sub-list .empty { color: var(--muted); font-size: 12px; text-align: center; padding: 14px 0; }
 
 .actions { display: flex; gap: 10px; margin-top: 6px; }
+.paused-tip {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #b45309;
+  font-size: 11px;
+  line-height: 1.5;
+}
 
 /* ---------- 消息记录 ---------- */
 .msg-head { display: flex; align-items: center; justify-content: space-between; }
@@ -1089,6 +1313,17 @@ body { margin: 0; }
 .modal-foot {
   display: flex; justify-content: flex-end; gap: 10px;
   padding: 14px 18px; border-top: 1px solid var(--border);
+}
+.err-modal { width: 460px; max-width: 90vw; }
+.err-body {
+  color: var(--red);
+  background: var(--red-bg);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-all;
+  user-select: text;
 }
 .text-input {
   width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
