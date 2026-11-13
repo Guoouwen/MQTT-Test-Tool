@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Validate versions
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauri = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargo = ([regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
+          if ($pkg -ne $tag -or $tauri -ne $tag -or $cargo -ne $tag) {
+            throw "版本不一致: tag=v$tag, package.json=$pkg, tauri.conf.json=$tauri, Cargo.toml=$cargo"
+          }
+          Write-Host "版本校验通过: v$tag"
+
+      - name: Build and release (NSIS installer)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'MQTT Test Tool ${{ github.ref_name }}'
+          releaseBody: 'Windows 安装包（setup.exe）或绿色便携版（portable.zip），按需下载。'
+          releaseDraft: false
+          prerelease: false
+          args: --bundles nsis
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $ver = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Compress-Archive -Path 'src-tauri/target/release/mqtt-downlink-tool.exe' -DestinationPath "MQTT-Test-Tool_${ver}_x64_portable.zip"
+
+      - name: Upload portable zip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          gh release upload '${{ github.ref_name }}' "MQTT-Test-Tool_${ver}_x64_portable.zip" --clobber
