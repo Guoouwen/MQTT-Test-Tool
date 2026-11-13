@@ -1,6 +1,6 @@
 [package]
 name = "mqtt-downlink-tool"
-version = "1.0.0"
+version = "1.0.1"
 description = "MQTT 下行测试工具：模拟服务端通过 MQTT 5.0 协议向设备下发消息并接收回执"
 authors = ["Guoouwen"]
 edition = "2024"

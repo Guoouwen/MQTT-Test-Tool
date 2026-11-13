@@ -44,28 +44,56 @@ jobs:
           }
           Write-Host "版本校验通过: v$tag"
 
-      - name: Build and release (NSIS installer)
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'MQTT Test Tool ${{ github.ref_name }}'
-          releaseBody: 'Windows 安装包（setup.exe）或绿色便携版（portable.zip），按需下载。'
-          releaseDraft: false
-          prerelease: false
-          args: --bundles nsis
+      - name: Build NSIS installer
+        run: npm run tauri build -- --bundles nsis
 
-      - name: Package portable zip
+      - name: Normalize artifacts
         shell: pwsh
         run: |
           $ver = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          Compress-Archive -Path 'src-tauri/target/release/mqtt-downlink-tool.exe' -DestinationPath "MQTT-Test-Tool_${ver}_x64_portable.zip"
+          $base = "MQTT-Test-Tool_${ver}_x64"
 
-      - name: Upload portable zip
+          # 1) 安装包：Tauri 会把 productName 中的空格转成点，统一改成连字符命名
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw "未找到 NSIS 安装包" }
+          $setup = "$base-setup.exe"
+          Copy-Item $installer.FullName $setup
+          Write-Host "安装包: $setup ($([math]::Round($installer.Length/1MB,2)) MB)"
+
+          # 2) 绿色便携版：重命名二进制为规范名后打包 zip
+          $exe = 'src-tauri/target/release/mqtt-downlink-tool.exe'
+          if (-not (Test-Path $exe)) { throw "未找到 release 二进制" }
+          $portableDir = Join-Path $env:RUNNER_TEMP 'portable'
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item $exe (Join-Path $portableDir 'MQTT-Test-Tool.exe')
+          $portable = "$base-portable.zip"
+          Compress-Archive -Path (Join-Path $portableDir 'MQTT-Test-Tool.exe') -DestinationPath $portable
+          Write-Host "便携版: $portable"
+
+          Write-Output "setup=$setup" >> $env:GITHUB_ENV
+          Write-Output "portable=$portable" >> $env:GITHUB_ENV
+
+      - name: Create release and upload
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $ver = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          gh release upload '${{ github.ref_name }}' "MQTT-Test-Tool_${ver}_x64_portable.zip" --clobber
+          $setup = $env:setup
+          $portable = $env:portable
+          $notes = @"
+          ## MQTT Test Tool `${{ github.ref_name }}
+
+          MQTT 5.0 下行测试工具（Windows x64）。
+
+          ### 下载说明
+
+          | 文件 | 说明 |
+          | --- | --- |
+          | `$setup` | 安装包，双击安装，自动创建快捷方式 |
+          | `$portable` | 绿色便携版，解压后双击 `MQTT-Test-Tool.exe` 即用 |
+
+          > 依赖系统 WebView2（Win10/11 已预装，缺失时会提示安装）。
+          "@
+          gh release create '${{ github.ref_name }}' $setup $portable `
+            --title "MQTT Test Tool ${{ github.ref_name }}" `
+            --notes $notes
