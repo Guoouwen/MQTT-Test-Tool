@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "mqtt-downlink-tool"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "rumqttc",
  "serde",
