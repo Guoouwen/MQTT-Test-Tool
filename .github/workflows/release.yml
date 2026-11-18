@@ -80,10 +80,22 @@ jobs:
         run: |
           $setup = $env:setup
           $portable = $env:portable
+
+          # 从 README 提取「功能特性」段落，作为 release notes 的功能清单
+          $readme = Get-Content README.md -Raw -Encoding UTF8
+          $start = $readme.IndexOf('## 功能特性')
+          $end = $readme.IndexOf('## 下载')
+          if ($start -lt 0 -or $end -lt 0 -or $end -le $start) {
+            throw "README.md 缺少「## 功能特性」或「## 下载」标题，无法生成 release notes"
+          }
+          $features = $readme.Substring($start, $end - $start).Trim()
+
           $notes = @"
           ## MQTT Test Tool `${{ github.ref_name }}
 
           MQTT 5.0 下行测试工具（Windows x64）。
+
+          $features
 
           ### 下载说明
 
@@ -94,6 +106,8 @@ jobs:
 
           > 依赖系统 WebView2（Win10/11 已预装，缺失时会提示安装）。
           "@
+
+          Set-Content -Path release-notes.md -Value $notes -Encoding utf8
           gh release create '${{ github.ref_name }}' $setup $portable `
             --title "MQTT Test Tool ${{ github.ref_name }}" `
-            --notes $notes
+            --notes-file release-notes.md

@@ -59,6 +59,8 @@ npm run tauri build
 
 发版前请保持版本号一致：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 四处。
 
+> Release 说明会自动从上方「功能特性」段落生成：改动功能描述只需更新 README，无需手动改 release notes。
+
 ```bash
 npm version 1.1.0          # 同步 package.json 版本
 # 手动同步 tauri.conf.json 与 Cargo.toml / Cargo.lock 的 version 后提交
