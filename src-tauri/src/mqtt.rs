@@ -70,12 +70,15 @@ impl MqttManager {
                 .build()
                 .expect("failed to build tokio runtime");
             rt.block_on(async move {
+                // 首次连接成功后再断线才自动重连；首次连接失败直接报错，避免填错地址后无限重试。
+                let mut connected_once = false;
                 loop {
                     if !running.load(Ordering::SeqCst) {
                         break;
                     }
                     match eventloop.poll().await {
                         Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+                            connected_once = true;
                             let _ = app.emit(
                                 "mqtt-status",
                                 StatusEvent {
@@ -85,9 +88,18 @@ impl MqttManager {
                             );
                         }
                         Ok(Event::Incoming(Incoming::Publish(p))) => {
+                            // 二进制 payload（如 protobuf 回执）转 hex（0x 前缀），前端据此区分文本与二进制
+                            let payload = match String::from_utf8(p.payload.to_vec()) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    let hex: String =
+                                        p.payload.iter().map(|b| format!("{b:02x}")).collect();
+                                    format!("0x{hex}")
+                                }
+                            };
                             let msg = IncomingMessage {
                                 topic: String::from_utf8_lossy(&p.topic).to_string(),
-                                payload: String::from_utf8_lossy(&p.payload).to_string(),
+                                payload,
                                 qos: qos_to_u8(p.qos),
                                 timestamp: now_ms(),
                             };
@@ -101,17 +113,38 @@ impl MqttManager {
                                     message: "已断开".into(),
                                 },
                             );
-                            break;
-                        }
-                        Err(e) => {
+                            if !connected_once || !running.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let _ = app.emit(
                                 "mqtt-status",
                                 StatusEvent {
                                     connected: false,
-                                    message: format!("连接错误: {e}"),
+                                    message: "重连中...".into(),
                                 },
                             );
-                            break;
+                            // rumqttc 持续 poll 即自动重连；稍等后继续循环触发重连
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                        Err(e) => {
+                            if !connected_once || !running.load(Ordering::SeqCst) {
+                                let _ = app.emit(
+                                    "mqtt-status",
+                                    StatusEvent {
+                                        connected: false,
+                                        message: format!("连接错误: {e}"),
+                                    },
+                                );
+                                break;
+                            }
+                            let _ = app.emit(
+                                "mqtt-status",
+                                StatusEvent {
+                                    connected: false,
+                                    message: format!("重连中... {e}"),
+                                },
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         }
                         _ => {}
                     }

@@ -13,6 +13,11 @@ interface ConnConfig {
   clientId: string;
 }
 type Format = 'json' | 'protobuf' | 'plaintext';
+interface ProtoField {
+  fieldNumber: number | null;
+  type: string;
+  value: string;
+}
 interface PublishConfig {
   topic: string;
   payload: string;
@@ -25,6 +30,8 @@ interface PublishConfig {
   durationSec: number;
   durationUnit: 'sec' | 'hour';
   autoSeq: boolean;
+  protoFields: ProtoField[];
+  protoMode: 'fields' | 'hex';
 }
 interface Profile {
   id: string;
@@ -54,9 +61,14 @@ const FORMAT_TEMPLATES: Record<Format, string> = {
 };
 const FORMAT_HINTS: Record<Format, string> = {
   json: '支持变量 {{seq}} {{timestamp}} {{datetime}} {{clientId}}；新一批从 1 递增，暂停续发接着计数',
-  protobuf: 'protobuf 二进制 hex 编码（如 0a0548656c6c6f），不支持变量替换',
+  protobuf: '字段表格：填字段号/类型/值，发送时自动编码为二进制；Hex 原始：手填 hex 字节。string 值支持变量替换',
   plaintext: '支持变量 {{seq}} {{timestamp}} {{datetime}} {{clientId}}；新一批从 1 递增，暂停续发接着计数',
 };
+// protobuf 字段表格支持的类型（第一版仅标量，不含嵌套 message / repeated）
+const PROTO_TYPES = [
+  'int32', 'int64', 'uint32', 'uint64', 'sint32', 'sint64', 'bool', 'enum',
+  'string', 'bytes', 'float', 'double', 'fixed32', 'fixed64', 'sfixed32', 'sfixed64',
+];
 // 记住各格式各自的内容，切换时不丢失
 const savedPayloads: Record<Format, string> = { ...FORMAT_TEMPLATES };
 
@@ -76,6 +88,8 @@ function defaultPublish(): PublishConfig {
     durationSec: 60,
     durationUnit: 'sec',
     autoSeq: false,
+    protoFields: [],
+    protoMode: 'fields',
   };
 }
 function newId() {
@@ -90,6 +104,7 @@ const timeoutMs = ref(10000);
 
 const connected = ref(false);
 const connecting = ref(false);
+const reconnecting = ref(false);
 const statusText = ref('未连接');
 const errorMsg = ref('');
 function showError(msg: string) {
@@ -100,10 +115,16 @@ function closeError() {
 }
 
 const subInput = ref('');
+// 订阅主题行内编辑状态
+const editingSub = ref<string | null>(null);
+const editingSubValue = ref('');
 const subQos = ref(0);
 
 const messages = ref<Message[]>([]);
 const filter = ref<'all' | 'send' | 'recv'>('all');
+const statusFilter = ref<'all' | 'success' | 'timeout' | 'waiting'>('all');
+const topicSearch = ref('');
+const detailMsg = ref<Message | null>(null);
 let seq = 1;
 let timer: number | null = null;
 let stopping = false;
@@ -135,6 +156,8 @@ function applyProfile(p: Profile) {
   Object.assign(conn, p.conn);
   subscriptions.value = [...p.subscriptions];
   Object.assign(publish, p.publish);
+  // 数组深拷贝，避免多方案共享同一个 protoFields 引用
+  publish.protoFields = (p.publish.protoFields || []).map((f) => ({ ...f }));
   timeoutMs.value = p.timeoutMs;
   Object.assign(savedPayloads, FORMAT_TEMPLATES);
   savedPayloads[publish.format] = publish.payload;
@@ -145,7 +168,7 @@ function saveActiveProfile() {
   if (p) {
     p.conn = { ...conn };
     p.subscriptions = [...subscriptions.value];
-    p.publish = { ...publish };
+    p.publish = { ...publish, protoFields: publish.protoFields.map((f) => ({ ...f })) };
     p.timeoutMs = timeoutMs.value;
   }
 }
@@ -168,6 +191,12 @@ function normalizeProfile(raw: any): Profile {
   if (publish.format === 'json' && publish.payload && publish.payload.includes('"cmd": "cmd"')) {
     publish.payload = FORMAT_TEMPLATES.json;
   }
+  // protobuf 字段表格：兜底补齐每个字段行的默认值
+  publish.protoFields = (publish.protoFields || []).map((f: any) => ({
+    fieldNumber: typeof f.fieldNumber === 'number' ? f.fieldNumber : null,
+    type: f.type || 'string',
+    value: f.value || '',
+  }));
   return {
     id: raw.id || newId(),
     name: raw.name || '默认方案',
@@ -219,12 +248,14 @@ function switchProfile(id: string) {
   if (id === activeProfileId.value) return;
   if (connected.value) doDisconnect();
   saveActiveProfile();
+  saveSendpoint(activeProfileId.value); // 切走前保存当前方案断点
   activeProfileId.value = id;
   const p = profiles.value.find((x) => x.id === id);
   if (p) applyProfile(p);
   messages.value = [];
   seq = 1;
   resetSendState();
+  loadSendpoint(id); // 切到目标方案后恢复其断点
   persistProfiles();
 }
 function onProfileSelectChange(e: Event) {
@@ -265,7 +296,9 @@ function openDeleteModal() {
   showDeleteModal.value = true;
 }
 function confirmDelete() {
-  profiles.value = profiles.value.filter((x) => x.id !== activeProfileId.value);
+  const deletedId = activeProfileId.value;
+  profiles.value = profiles.value.filter((x) => x.id !== deletedId);
+  clearSendpoint(deletedId);
   activeProfileId.value = profiles.value[0].id;
   applyProfile(profiles.value[0]);
   messages.value = [];
@@ -307,6 +340,182 @@ function switchFormat(f: Format) {
 }
 const formatHint = computed(() => FORMAT_HINTS[publish.format]);
 
+// ---------- protobuf 字段表格 ----------
+function switchProtoMode(m: 'fields' | 'hex') {
+  if (publish.protoMode === m) return;
+  publish.protoMode = m;
+  saveConfig();
+}
+function addProtoField() {
+  publish.protoFields.push({ fieldNumber: null, type: 'string', value: '' });
+  saveConfig();
+}
+function removeProtoField(i: number) {
+  publish.protoFields.splice(i, 1);
+  saveConfig();
+}
+function protoValuePlaceholder(type: string) {
+  if (type === 'string') return '字符串，支持 {{seq}} 等变量';
+  if (type === 'bytes') return 'hex 编码，如 0a0548656c6c6f';
+  if (type === 'bool') return 'true / false';
+  if (type === 'float' || type === 'double') return '如 3.14';
+  return '整数';
+}
+
+// ---------- protobuf 实时预览（前端 TS 编码，与 Rust proto.rs 对齐；仅用于预览，实际发送以 Rust 端为准） ----------
+function writeVarint(out: number[], v: bigint) {
+  while (true) {
+    let b = Number(v & 0x7fn);
+    v >>= 7n;
+    if (v !== 0n) b |= 0x80;
+    out.push(b);
+    if (v === 0n) break;
+  }
+}
+function parseBigInt(s: string): bigint | null {
+  const t = s.trim();
+  if (!/^-?\d+$/.test(t)) return null;
+  try {
+    return BigInt(t);
+  } catch {
+    return null;
+  }
+}
+function hexToBytes(s: string): number[] {
+  const cleaned = s.replace(/\s/g, '').replace(/^0x/i, '');
+  if (cleaned.length === 0 || cleaned.length % 2 !== 0) {
+    return Array.from(new TextEncoder().encode(s));
+  }
+  const out: number[] = [];
+  for (let i = 0; i < cleaned.length; i += 2) {
+    const b = parseInt(cleaned.slice(i, i + 2), 16);
+    if (isNaN(b)) return Array.from(new TextEncoder().encode(s));
+    out.push(b);
+  }
+  return out;
+}
+function encodeProtoPreview(fields: ProtoField[]): number[] {
+  const out: number[] = [];
+  const enc = new TextEncoder();
+  for (const f of fields) {
+    const num = f.fieldNumber ?? 0;
+    const val = f.value;
+    let wireType = 0;
+    let payload: number[] = [];
+    switch (f.type) {
+      case 'int32':
+      case 'int64': {
+        const v = parseBigInt(val);
+        if (v == null) throw new Error(`字段 ${num} 的 int 值「${val}」不是合法整数`);
+        wireType = 0;
+        writeVarint(payload, BigInt.asUintN(64, v));
+        break;
+      }
+      case 'uint32':
+      case 'uint64':
+      case 'enum': {
+        const v = parseBigInt(val);
+        if (v == null || v < 0n) throw new Error(`字段 ${num} 的值「${val}」不是非负整数`);
+        wireType = 0;
+        writeVarint(payload, v);
+        break;
+      }
+      case 'sint32': {
+        const v = parseBigInt(val);
+        if (v == null) throw new Error(`字段 ${num} 的 sint32 值「${val}」不是合法整数`);
+        wireType = 0;
+        writeVarint(payload, BigInt.asUintN(32, (v << 1n) ^ (v >> 31n)));
+        break;
+      }
+      case 'sint64': {
+        const v = parseBigInt(val);
+        if (v == null) throw new Error(`字段 ${num} 的 sint64 值「${val}」不是合法整数`);
+        wireType = 0;
+        writeVarint(payload, BigInt.asUintN(64, (v << 1n) ^ (v >> 63n)));
+        break;
+      }
+      case 'bool': {
+        wireType = 0;
+        writeVarint(payload, ['true', '1', 'yes'].includes(val.trim().toLowerCase()) ? 1n : 0n);
+        break;
+      }
+      case 'string': {
+        wireType = 2;
+        const bytes = Array.from(enc.encode(val));
+        writeVarint(payload, BigInt(bytes.length));
+        payload.push(...bytes);
+        break;
+      }
+      case 'bytes': {
+        wireType = 2;
+        const bytes = hexToBytes(val);
+        writeVarint(payload, BigInt(bytes.length));
+        payload.push(...bytes);
+        break;
+      }
+      case 'float': {
+        const x = Number(val.trim());
+        if (isNaN(x)) throw new Error(`字段 ${num} 的 float 值「${val}」不是合法小数`);
+        wireType = 5;
+        const buf = new ArrayBuffer(4);
+        new DataView(buf).setFloat32(0, x, true);
+        payload = Array.from(new Uint8Array(buf));
+        break;
+      }
+      case 'fixed32':
+      case 'sfixed32': {
+        const v = parseBigInt(val);
+        if (v == null) throw new Error(`字段 ${num} 的值「${val}」不是合法整数`);
+        wireType = 5;
+        const buf = new ArrayBuffer(4);
+        new DataView(buf).setUint32(0, Number(BigInt.asUintN(32, v)), true);
+        payload = Array.from(new Uint8Array(buf));
+        break;
+      }
+      case 'double': {
+        const x = Number(val.trim());
+        if (isNaN(x)) throw new Error(`字段 ${num} 的 double 值「${val}」不是合法小数`);
+        wireType = 1;
+        const buf = new ArrayBuffer(8);
+        new DataView(buf).setFloat64(0, x, true);
+        payload = Array.from(new Uint8Array(buf));
+        break;
+      }
+      case 'fixed64':
+      case 'sfixed64': {
+        const v = parseBigInt(val);
+        if (v == null) throw new Error(`字段 ${num} 的值「${val}」不是合法整数`);
+        wireType = 1;
+        const u = BigInt.asUintN(64, v);
+        const buf = new ArrayBuffer(8);
+        const dv = new DataView(buf);
+        dv.setUint32(0, Number(u & 0xffffffffn), true);
+        dv.setUint32(4, Number((u >> 32n) & 0xffffffffn), true);
+        payload = Array.from(new Uint8Array(buf));
+        break;
+      }
+      default:
+        throw new Error(`不支持的 protobuf 类型「${f.type}」`);
+    }
+    writeVarint(out, (BigInt(num) << 3n) | BigInt(wireType));
+    out.push(...payload);
+  }
+  return out;
+}
+const protoPreview = computed(() => {
+  if (publish.format !== 'protobuf' || publish.protoMode !== 'fields') return '';
+  const fields = publish.protoFields.filter(
+    (f) => f.fieldNumber != null && f.fieldNumber >= 1 && f.value !== '',
+  );
+  if (fields.length === 0) return '';
+  try {
+    const bytes = encodeProtoPreview(fields);
+    return '0x' + bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+  } catch (e) {
+    return '编码错误：' + (e as Error).message;
+  }
+});
+
 // 暂停态提示（显示剩余量，说明续发不会重置序号）
 const pausedTip = computed(() => {
   if (sendState.value !== 'paused') return '';
@@ -327,12 +536,19 @@ const stats = computed(() => {
 });
 
 const filteredMessages = computed(() => {
-  const list =
-    filter.value === 'all'
-      ? messages.value
-      : messages.value.filter((m) =>
-          filter.value === 'send' ? m.direction === 'send' : m.direction === 'recv',
-        );
+  let list = messages.value;
+  if (filter.value !== 'all') {
+    list = list.filter((m) =>
+      filter.value === 'send' ? m.direction === 'send' : m.direction === 'recv',
+    );
+  }
+  if (statusFilter.value !== 'all') {
+    list = list.filter((m) => m.status === statusFilter.value);
+  }
+  const kw = topicSearch.value.trim();
+  if (kw) {
+    list = list.filter((m) => m.topic.includes(kw));
+  }
   // 新消息排最上（倒序展示，不改变内部数组顺序，保证配对逻辑稳定）
   return [...list].reverse();
 });
@@ -391,6 +607,39 @@ function extractSeq(payload: string): number | null {
   return null;
 }
 
+// ---------- 消息内容展示 ----------
+// 判断是否为二进制 hex 内容（后端把非 UTF-8 二进制回执转成 0x 前缀）
+function isHexContent(content: string) {
+  return content.startsWith('0x') || content.startsWith('0X');
+}
+// 详情展示：JSON 美化、hex 原样、其余纯文本
+function prettyContent(content: string) {
+  if (isHexContent(content)) return content;
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    return content;
+  }
+}
+function openDetail(m: Message) {
+  detailMsg.value = m;
+}
+function closeDetail() {
+  detailMsg.value = null;
+}
+async function copyMessage(content: string) {
+  try {
+    await navigator.clipboard.writeText(content);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = content;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+}
+
 // ---------- MQTT 操作 ----------
 async function doConnect() {
   if (!conn.host || !conn.clientId) return;
@@ -441,6 +690,46 @@ async function removeSub(topic: string) {
   }
 }
 
+// 点击主题进入编辑态
+function startEditSub(topic: string) {
+  editingSub.value = topic;
+  editingSubValue.value = topic;
+}
+function cancelEditSub() {
+  editingSub.value = null;
+  editingSubValue.value = '';
+}
+// 确认编辑：改主题（旧退订 + 新订阅）
+async function confirmEditSub() {
+  const oldTopic = editingSub.value;
+  if (oldTopic == null) return;
+  const newTopic = editingSubValue.value.trim();
+  if (!newTopic || newTopic === oldTopic) {
+    cancelEditSub();
+    return;
+  }
+  if (subscriptions.value.includes(newTopic)) {
+    showError('订阅主题已存在: ' + newTopic);
+    return;
+  }
+  editingSub.value = null;
+  editingSubValue.value = '';
+  subscriptions.value = subscriptions.value.map((t) => (t === oldTopic ? newTopic : t));
+  saveConfig();
+  if (connected.value) {
+    try {
+      await invoke('unsubscribe', { topic: oldTopic });
+    } catch (e) {
+      /* 忽略 */
+    }
+    try {
+      await invoke('subscribe', { topic: newTopic, qos: subQos.value });
+    } catch (e) {
+      showError('订阅失败: ' + e);
+    }
+  }
+}
+
 async function resubscribeAll() {
   for (const topic of subscriptions.value) {
     try {
@@ -453,17 +742,47 @@ async function resubscribeAll() {
 
 // ---------- 发送 ----------
 function sendOne() {
-  const payload =
-    publish.format === 'protobuf'
-      ? publish.payload
-      : resolveVariables(publish.payload, seq);
+  const isProtoFields = publish.format === 'protobuf' && publish.protoMode === 'fields';
+  // 表格模式：过滤未填字段号的行，string 值做变量替换，其余类型原样
+  let payload: string;
+  let protoFields: ProtoField[] | null = null;
+  if (isProtoFields) {
+    protoFields = publish.protoFields
+      .filter((f) => f.fieldNumber != null && f.fieldNumber >= 1)
+      .map((f) => ({
+        fieldNumber: f.fieldNumber!,
+        type: f.type,
+        value: f.type === 'string' ? resolveVariables(f.value, seq) : f.value,
+      }));
+    if (protoFields.length === 0) {
+      showError('protobuf 字段表格为空，请至少填写一个字段（字段号 + 值）');
+      return;
+    }
+    payload = '';
+  } else {
+    payload =
+      publish.format === 'protobuf'
+        ? publish.payload
+        : resolveVariables(publish.payload, seq);
+    // JSON 发送前本地校验，格式错直接拦截，不发出去
+    if (publish.format === 'json') {
+      try {
+        JSON.parse(payload);
+      } catch (e) {
+        showError('JSON 格式错误，未发送：\n' + (e as Error).message);
+        return;
+      }
+    }
+  }
   const rec: Message = {
     id: ++msgId,
     time: timeStr(),
     topic: publish.topic,
     direction: 'send',
     qos: publish.qos,
-    content: payload,
+    content: protoFields
+      ? protoFields.map((f) => `${f.fieldNumber}:${f.type}=${f.value}`).join(' ')
+      : payload,
     seq,
     status: 'waiting',
     sendAt: Date.now(),
@@ -476,6 +795,7 @@ function sendOne() {
       qos: publish.qos,
       retain: publish.retain,
       format: publish.format,
+      protoFields,
     },
   }).catch((e) => {
     rec.status = 'timeout';
@@ -498,6 +818,48 @@ function resetSendState() {
   sendState.value = 'idle';
   pausedLeft.value = 0;
   pausedLeftMs.value = 0;
+}
+
+// ---------- 断点持久化（跨会话续发） ----------
+type Sendpoint = { mode: string; pausedLeft: number; pausedLeftMs: number; seq: number };
+const SEND_KEY = 'mqtt-downlink-sendpoint';
+function readSendpoints(): Record<string, Sendpoint> {
+  try {
+    return JSON.parse(localStorage.getItem(SEND_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+function writeSendpoints(map: Record<string, Sendpoint>) {
+  localStorage.setItem(SEND_KEY, JSON.stringify(map));
+}
+// 暂停时保存当前方案断点；仅 paused 态才写，避免空断点残留
+function saveSendpoint(profileId: string) {
+  if (sendState.value !== 'paused') return;
+  const map = readSendpoints();
+  map[profileId] = {
+    mode: publish.mode,
+    pausedLeft: pausedLeft.value,
+    pausedLeftMs: pausedLeftMs.value,
+    seq,
+  };
+  writeSendpoints(map);
+}
+function clearSendpoint(profileId: string) {
+  const map = readSendpoints();
+  delete map[profileId];
+  writeSendpoints(map);
+}
+// 恢复方案断点（发送方式需匹配，否则断点语义失效）
+function loadSendpoint(profileId: string) {
+  const s = readSendpoints()[profileId];
+  if (!s || s.mode !== publish.mode) return;
+  pausedLeft.value = s.pausedLeft || 0;
+  pausedLeftMs.value = s.pausedLeftMs || 0;
+  seq = s.seq || 1;
+  if (pausedLeft.value > 0 || pausedLeftMs.value > 0) {
+    sendState.value = 'paused';
+  }
 }
 
 function startSend() {
@@ -560,6 +922,7 @@ function startSend() {
 }
 // 任务自然结束：清空断点，下次开始 = 新任务
 function finishRun() {
+  clearSendpoint(activeProfileId.value);
   resetSendState();
 }
 // 用户点停止 = 暂停，保留断点（下次点「继续发送」接着发，seq 不重置）
@@ -568,10 +931,12 @@ function stopSend() {
   clearTimer();
   if (sendState.value === 'running') {
     sendState.value = pausedLeft.value > 0 || pausedLeftMs.value > 0 ? 'paused' : 'idle';
+    if (sendState.value === 'paused') saveSendpoint(activeProfileId.value);
   }
 }
 // 放弃断点，重新从 1 开始发一批
 function restartSend() {
+  clearSendpoint(activeProfileId.value);
   resetSendState();
   startSend();
 }
@@ -637,6 +1002,9 @@ watch(() => publish.payload, () => {
   saveConfig();
 });
 
+// protobuf 字段表格变化时持久化
+watch(() => publish.protoFields, () => saveConfig(), { deep: true });
+
 // 切换发送方式会作废断点（按数量/按时长的续发语义不同，避免序号与剩余量错配）
 watch(() => publish.mode, () => resetSendState());
 
@@ -654,19 +1022,29 @@ onMounted(async () => {
   if (!conn.clientId) genClientIdFor(conn);
   savedPayloads[publish.format] = publish.payload;
   saveConfig();
+  loadSendpoint(activeProfileId.value);
   unlistenMsg = await listen('mqtt-message', (e) => onIncoming(e.payload as any));
   unlistenStatus = await listen('mqtt-status', (e) => {
     const s = e.payload as { connected: boolean; message: string };
-    connected.value = s.connected;
     connecting.value = false;
     if (s.connected) {
+      connected.value = true;
+      reconnecting.value = false;
       statusText.value = s.message;
       resubscribeAll();
+    } else if (s.message.startsWith('重连中')) {
+      connected.value = false;
+      reconnecting.value = true;
+      statusText.value = '重连中...';
     } else if (s.message.startsWith('连接错误')) {
       // 错误详情弹窗展示，角标只显示短语，避免长文本撑乱布局
+      connected.value = false;
+      reconnecting.value = false;
       statusText.value = '连接错误';
       showError(s.message);
     } else {
+      connected.value = false;
+      reconnecting.value = false;
       statusText.value = s.message;
     }
   });
@@ -708,7 +1086,7 @@ onUnmounted(() => {
       </div>
 
       <div class="top-right">
-        <span class="status-pill" :class="connected ? 'ok' : connecting ? 'ing' : 'off'">
+        <span class="status-pill" :class="connected ? 'ok' : (connecting || reconnecting) ? 'ing' : 'off'">
           {{ statusText }}
         </span>
         <button v-if="!connected" class="btn primary" :disabled="connecting" @click="doConnect">连接</button>
@@ -719,7 +1097,7 @@ onUnmounted(() => {
     <div class="body">
       <!-- 左栏：连接概览 + 订阅 -->
       <aside class="col-left">
-        <section class="card overview-card" @click="openConnModal" title="点击编辑连接设置">
+        <section class="card overview-card" :class="{ 'conn-broken': reconnecting }" @click="openConnModal" title="点击编辑连接设置">
           <div class="ov-head">
             <span class="ov-icon">⧉</span>
             <div class="ov-title">
@@ -751,7 +1129,7 @@ onUnmounted(() => {
           </div>
           <ul class="sub-list">
             <li v-for="t in subscriptions" :key="t">
-              <span class="topic-chip">{{ t }}</span>
+              <span class="topic-chip" title="点击编辑" @click="startEditSub(t)">{{ t }}</span>
               <button class="x" @click="removeSub(t)" title="删除">×</button>
             </li>
             <li v-if="subscriptions.length === 0" class="empty">暂无订阅</li>
@@ -779,7 +1157,77 @@ onUnmounted(() => {
                 <button class="tab" :class="{ on: publish.format === 'plaintext' }" @click="switchFormat('plaintext')">Plaintext</button>
               </div>
             </div>
-            <CodeEditor v-model="publish.payload" :format="publish.format" />
+
+            <!-- protobuf 子模式：字段表格 / Hex 原始 -->
+            <div v-if="publish.format === 'protobuf'" class="proto-mode-row">
+              <div class="seg">
+                <button
+                  class="seg-btn"
+                  :class="{ on: publish.protoMode === 'fields' }"
+                  @click="switchProtoMode('fields')"
+                >
+                  字段表格
+                </button>
+                <button
+                  class="seg-btn"
+                  :class="{ on: publish.protoMode === 'hex' }"
+                  @click="switchProtoMode('hex')"
+                >
+                  Hex 原始
+                </button>
+              </div>
+            </div>
+
+            <CodeEditor
+              v-if="publish.format !== 'protobuf' || publish.protoMode === 'hex'"
+              v-model="publish.payload"
+              :format="publish.format"
+            />
+
+            <!-- protobuf 字段表格：字段号 / 类型 / 值，发送时自动编码为二进制 -->
+            <div v-else class="proto-panel">
+              <table class="proto-table">
+                <thead>
+                  <tr>
+                    <th class="c-num">字段号</th>
+                    <th class="c-type">类型</th>
+                    <th class="c-val">值</th>
+                    <th class="c-op"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(f, i) in publish.protoFields" :key="i">
+                    <td class="c-num">
+                      <input v-model.number="f.fieldNumber" type="number" min="1" placeholder="1" />
+                    </td>
+                    <td class="c-type">
+                      <select v-model="f.type">
+                        <option v-for="t in PROTO_TYPES" :key="t" :value="t">{{ t }}</option>
+                      </select>
+                    </td>
+                    <td class="c-val">
+                      <input v-model="f.value" :placeholder="protoValuePlaceholder(f.type)" />
+                    </td>
+                    <td class="c-op">
+                      <button class="proto-del" title="删除该字段" @click="removeProtoField(i)">×</button>
+                    </td>
+                  </tr>
+                  <tr v-if="publish.protoFields.length === 0">
+                    <td colspan="4" class="empty">暂无字段，点击下方「添加字段」</td>
+                  </tr>
+                </tbody>
+              </table>
+              <button class="btn ghost add-field" @click="addProtoField">+ 添加字段</button>
+              <div
+                v-if="protoPreview"
+                class="proto-preview"
+                :class="{ 'has-err': protoPreview.startsWith('编码错误') }"
+              >
+                <span class="pp-label">编码预览</span>
+                <code class="pp-hex">{{ protoPreview }}</code>
+              </div>
+            </div>
+
             <div class="fmt-hint">
               <span>{{ formatHint }}</span>
               <label
@@ -883,10 +1331,22 @@ onUnmounted(() => {
       <!-- 右栏：消息记录 -->
       <main class="col-right">
         <div class="msg-head">
-          <div class="seg">
-            <button class="seg-btn" :class="{ on: filter === 'all' }" @click="filter = 'all'">全部</button>
-            <button class="seg-btn" :class="{ on: filter === 'send' }" @click="filter = 'send'">已发送</button>
-            <button class="seg-btn" :class="{ on: filter === 'recv' }" @click="filter = 'recv'">已接收</button>
+          <div class="msg-filters">
+            <div class="seg">
+              <button class="seg-btn" :class="{ on: filter === 'all' }" @click="filter = 'all'">全部</button>
+              <button class="seg-btn" :class="{ on: filter === 'send' }" @click="filter = 'send'">已发送</button>
+              <button class="seg-btn" :class="{ on: filter === 'recv' }" @click="filter = 'recv'">已接收</button>
+            </div>
+            <div class="seg">
+              <button class="seg-btn" :class="{ on: statusFilter === 'all' }" @click="statusFilter = 'all'">全部状态</button>
+              <button class="seg-btn" :class="{ on: statusFilter === 'success' }" @click="statusFilter = 'success'">成功</button>
+              <button class="seg-btn" :class="{ on: statusFilter === 'timeout' }" @click="statusFilter = 'timeout'">超时</button>
+              <button class="seg-btn" :class="{ on: statusFilter === 'waiting' }" @click="statusFilter = 'waiting'">等待</button>
+            </div>
+            <div class="igroup topic-filter">
+              <span class="iaddon">TOPIC</span>
+              <input v-model="topicSearch" placeholder="按主题过滤" />
+            </div>
           </div>
           <button class="btn ghost" @click="messages = []">清空记录</button>
         </div>
@@ -921,7 +1381,10 @@ onUnmounted(() => {
                   <span v-if="m.status === 'timeout'" class="badge-timeout">超时</span>
                 </td>
                 <td class="c-qos">{{ m.qos }}</td>
-                <td class="c-content" :title="m.content">{{ m.content }}</td>
+                <td class="c-content" :title="m.content">
+                  <span class="content-text" :class="{ 'is-hex': isHexContent(m.content) }" @click="openDetail(m)">{{ m.content }}</span>
+                  <button class="copy-btn" title="复制内容" @click="copyMessage(m.content)">⧉</button>
+                </td>
               </tr>
               <tr v-if="filteredMessages.length === 0">
                 <td colspan="5" class="empty">还没有消息，连接后发送即可在此查看</td>
@@ -1026,6 +1489,53 @@ onUnmounted(() => {
         <div class="modal-foot">
           <button class="btn" @click="showDeleteModal = false">取消</button>
           <button class="btn danger" @click="confirmDelete">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 消息详情弹窗 -->
+    <div v-if="detailMsg" class="modal-mask" @click.self="closeDetail">
+      <div class="modal detail-modal">
+        <div class="modal-head">
+          <span>消息详情</span>
+          <button class="modal-x" @click="closeDetail">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="detail-meta">
+            <span class="dir" :class="detailMsg.direction === 'send' ? 'up' : 'down'">{{ detailMsg.direction === 'send' ? '发送' : '接收' }}</span>
+            <span class="detail-topic">{{ detailMsg.topic }}</span>
+            <span>QoS {{ detailMsg.qos }}</span>
+            <span>{{ detailMsg.time }}</span>
+            <span v-if="detailMsg.status === 'timeout'" class="badge-timeout">超时</span>
+          </div>
+          <pre class="detail-content" :class="{ 'is-hex': isHexContent(detailMsg.content) }">{{ prettyContent(detailMsg.content) }}</pre>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" @click="closeDetail">关闭</button>
+          <button class="btn primary" @click="copyMessage(detailMsg.content)">复制内容</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 订阅主题编辑弹窗 -->
+    <div v-if="editingSub != null" class="modal-mask" @click.self="cancelEditSub">
+      <div class="modal">
+        <div class="modal-head">
+          <span>编辑订阅主题</span>
+          <button class="modal-x" @click="cancelEditSub">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="field">
+            <label>主题（Topic）</label>
+            <div class="igroup">
+              <span class="iaddon">SUB</span>
+              <input v-model="editingSubValue" placeholder="xxx/testDownRes" @keyup.enter="confirmEditSub" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" @click="cancelEditSub">取消</button>
+          <button class="btn primary" @click="confirmEditSub">确定</button>
         </div>
       </div>
     </div>
@@ -1183,6 +1693,58 @@ body { margin: 0; }
   cursor: pointer;
 }
 
+/* ---------- protobuf 字段表格 ---------- */
+.proto-mode-row { margin-bottom: 8px; }
+.proto-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.proto-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.proto-table thead th {
+  text-align: left;
+  padding: 7px 8px;
+  background: #f8fafc;
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+.proto-table td { padding: 5px 6px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+.proto-table tbody tr:last-child td { border-bottom: none; }
+.proto-table .c-num { width: 86px; }
+.proto-table .c-type { width: 104px; }
+.proto-table .c-op { width: 36px; text-align: center; }
+.proto-table input,
+.proto-table select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 12px;
+  background: #fff;
+  color: var(--text);
+  font-family: Consolas, monospace;
+}
+.proto-table input:focus,
+.proto-table select:focus {
+  outline: none;
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.12);
+}
+.proto-table .empty { color: var(--muted); text-align: center; padding: 14px 0; font-size: 12px; }
+.proto-del {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.proto-del:hover { color: var(--red); }
+.proto-panel .add-field { margin: 8px; }
+
 /* ---------- 内嵌标签输入组 ---------- */
 .igroup {
   display: flex; align-items: stretch; width: 100%;
@@ -1250,7 +1812,8 @@ body { margin: 0; }
 /* ---------- 订阅列表 ---------- */
 .sub-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
 .sub-list li { display: flex; align-items: flex-start; gap: 8px; padding: 7px 10px; background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; }
-.topic-chip { flex: 1; min-width: 0; font-family: Consolas, monospace; font-size: 12px; word-break: break-all; line-height: 1.5; }
+.topic-chip { flex: 1; min-width: 0; font-family: Consolas, monospace; font-size: 12px; word-break: break-all; line-height: 1.5; cursor: pointer; }
+.topic-chip:hover { color: var(--teal); text-decoration: underline; }
 .x { flex: none; border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 16px; padding: 0 4px; line-height: 1; }
 .x:hover { color: var(--red); }
 .sub-list .empty { color: var(--muted); font-size: 12px; text-align: center; padding: 14px 0; }
@@ -1332,4 +1895,109 @@ body { margin: 0; }
 .text-input:focus { outline: none; border-color: var(--teal); box-shadow: 0 0 0 3px rgba(13,148,136,.12); }
 .delete-tip { font-size: 13px; line-height: 1.7; color: var(--text); margin: 0; }
 .delete-tip b { color: var(--red); }
+
+/* ---------- 断线醒目化 ---------- */
+.overview-card.conn-broken {
+  border-color: var(--red);
+  background: var(--red-bg);
+}
+.overview-card.conn-broken .ov-name { color: var(--red); }
+
+/* ---------- 消息记录增强 ---------- */
+.msg-filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.msg-head { gap: 10px; }
+.topic-filter { width: 180px; flex: none; }
+.copy-btn {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  margin-left: 4px;
+  vertical-align: middle;
+  opacity: 0;
+}
+.msg-table tr:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { color: var(--teal); }
+.content-text { cursor: pointer; }
+.content-text:hover { color: var(--teal); text-decoration: underline; }
+.content-text.is-hex { color: #7c3aed; }
+
+/* ---------- 消息详情弹窗 ---------- */
+.detail-modal { width: 560px; max-width: 92vw; }
+.detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.detail-topic {
+  font-family: Consolas, monospace;
+  color: var(--teal-dark);
+  word-break: break-all;
+}
+.detail-content {
+  margin: 0;
+  padding: 12px;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 420px;
+  overflow: auto;
+  user-select: text;
+}
+.detail-content.is-hex { color: #7c3aed; }
+
+/* ---------- protobuf 编码预览 ---------- */
+.proto-preview {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 8px;
+  padding: 8px 10px;
+  background: #f0fdfa;
+  border: 1px solid #99f6e4;
+  border-radius: 6px;
+}
+.proto-preview.has-err {
+  background: var(--red-bg);
+  border-color: #fecaca;
+}
+.pp-label {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--teal-dark);
+  padding-top: 1px;
+}
+.proto-preview.has-err .pp-label { color: var(--red); }
+.pp-hex {
+  flex: 1;
+  min-width: 0;
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  word-break: break-all;
+  line-height: 1.6;
+  color: var(--text);
+  user-select: text;
+}
+.proto-preview.has-err .pp-hex { color: var(--red); }
 </style>
